@@ -130,9 +130,8 @@ class ControlParams:
 
 @safe_disconnect
 def run_actions(robot: Robot, params: ControlParams, policy) -> None:
-    """Stream actions from a pre‑trained policy, optionally adding a one‑hot task vector."""
-
-    # --- Connect robot ---
+    """Stream actions from a pre-trained policy, optionally conditioned by a one-hot vector."""
+    # -- Connect robot --------------------------------------------------------
     if not robot.is_connected:
         robot.connect()
 
@@ -141,43 +140,56 @@ def run_actions(robot: Robot, params: ControlParams, policy) -> None:
         if isinstance(arm, ModbusRTUMotorsBus):
             arm.write("Torque_Enable", 1)
 
-    # --- Load policy once ---
     device = get_safe_torch_device(DEVICE)
 
-    fifo: deque[torch.Tensor] = deque(maxlen=20)
+    fifo: deque[torch.Tensor] = deque(maxlen=20)              # idle-motion detector
     per_axis_thresh = torch.tensor([0.5, 0.5, 0.7, 0.7, 0.7, 0.1, 1500])
 
     start_episode_t = time.perf_counter()
     timestamp = 0.0
-    start_time = time.time()
+    idle_start_wall_t = time.time()
 
-    print(">>> Running policy…  (Ctrl‑C to stop)")
+    print(">>> Running policy…  (Ctrl-C to stop)")
     while params.episode_time_s is None or timestamp < params.episode_time_s:
         loop_start_t = time.perf_counter()
 
-        # 1) Observation ↦ policy ↦ action
+        # ------------------------------------------------------------------ 1
+        # Observation → Policy → Action (+ done flag)
+        # ---------------------------------------------------------------------
         obs = robot.capture_observation()
         if params.onehot is not None:
             obs["onehot_task"] = params.onehot
-        act = predict_action(obs, policy, device, use_amp=False)
+
+        act, done = predict_action(obs, policy, device, use_amp=False)
         sent_act = robot.send_action(act)
         fifo.append(sent_act.clone())
 
-        # 2) Auto‑stop if no movement
+        # ------------------------------------------------------------------ 2
+        # Stop criteria
+        # ---------------------------------------------------------------------
+        if done:
+            print(">>> Model-driven stop: done = True")
+            break
+
         if len(fifo) == fifo.maxlen:
             std_per_motor = torch.std(torch.stack(list(fifo)), dim=0)
             if torch.all(std_per_motor < per_axis_thresh):
-                if (time.time() - start_time) > 5:
-                    print(">>> Auto‑stop: robot idle (std < threshold)")
+                if (time.time() - idle_start_wall_t) > 5:
+                    print(">>> Auto-stop: robot idle (std < threshold)")
                     break
+        else:
+            idle_start_wall_t = time.time()      # reset idle timer
 
-        # 3) Keep constant FPS
+        # ------------------------------------------------------------------ 3
+        # Maintain constant FPS
+        # ---------------------------------------------------------------------
         if params.fps:
             busy_wait(max(0, 1 / params.fps - (time.perf_counter() - loop_start_t)))
 
         timestamp = time.perf_counter() - start_episode_t
 
     print(">>> Done!")
+
 
 
 ########################################################################################

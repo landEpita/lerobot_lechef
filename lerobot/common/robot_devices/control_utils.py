@@ -102,30 +102,44 @@ def is_headless():
 
 
 def predict_action(observation, policy, device, use_amp):
-    observation = copy(observation)
+    """
+    Run `policy.select_action` on a *single* observation dict and return:
+
+        action  – Tensor of joint targets (batch-dim removed, on CPU)
+        done    – Bool flag, True if the policy says the task is complete
+
+    The function is backward-compatible with checkpoints whose
+    `select_action` returns only the action tensor.
+    """
+    observation = copy(observation)                          # avoid side-effects
+
     with (
         torch.inference_mode(),
-        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+        torch.autocast(device_type=device.type)              # AMP on CUDA only
+        if device.type == "cuda" and use_amp else nullcontext()
     ):
-        # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
-        for name in observation:
+        # --- Pre-process images & move everything to device ------------------
+        for name, val in observation.items():
             if "image" in name:
-                observation[name] = observation[name].type(torch.float32) / 255
-                observation[name] = observation[name].permute(2, 0, 1).contiguous()
-            observation[name] = observation[name].unsqueeze(0)
-            observation[name] = observation[name].to(device)
+                val = val.type(torch.float32) / 255.0        # uint8 → float32 in [0,1]
+                val = val.permute(2, 0, 1).contiguous()      # HWC → CHW
+                observation[name] = val
+            observation[name] = observation[name].unsqueeze(0).to(device)
 
-        # Compute the next action with the policy
-        # based on the current observation
-        action = policy.select_action(observation)
+        # --- Inference -------------------------------------------------------
+        out = policy.select_action(observation)
 
-        # Remove batch dimension
-        action = action.squeeze(0)
+        # Support both new (tuple) and old (tensor-only) signatures
+        if isinstance(out, tuple):
+            action, done = out
+        else:
+            action, done = out, False
 
-        # Move to cpu, if not already the case
-        action = action.to("cpu")
+        # Remove batch dimension, move to CPU
+        action = action.squeeze(0).to("cpu")
 
-    return action
+    return action, done
+
 
 
 def init_keyboard_listener():
